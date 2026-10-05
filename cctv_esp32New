@@ -1,0 +1,357 @@
+/*
+   ============================================================
+   โปรเจกต์ : ESP32-CAM กล้องวงจรปิดผ่าน Browser (แก้ไขปัญหา WiFi หลุด)
+   บอร์ด     : AI Thinker ESP32-CAM
+   โหมด WiFi : Access Point (ESP32-CAM ปล่อย WiFi เอง)
+   ============================================================
+*/
+
+#include "esp_camera.h"
+#include "esp_http_server.h"
+#include "img_converters.h"
+#include <WiFi.h>
+
+// ============================================================
+// ตั้งค่า WiFi ที่ ESP32-CAM จะปล่อยออกมาเอง
+// ============================================================
+const char *AP_SSID = "ESP32-CAM-CCTV20";
+const char *AP_PASSWORD = "88888888";
+
+// กำหนด IP Address
+IPAddress local_IP(192, 168, 4, 1);
+IPAddress gateway(192, 168, 4, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// กำหนดขา GPIO ของกล้อง AI Thinker
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+
+#define FLASH_LED_PIN 4
+bool flashState = false;
+
+httpd_handle_t camera_httpd = NULL;
+httpd_handle_t stream_httpd = NULL;
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *STREAM_PART = "Content-Type: image/jpeg\r\n"
+                                 "Content-Length: %u\r\n\r\n";
+
+// HTML Web Page
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>ESP32-CAM CCTV</title>
+<style>
+*{box-sizing:border-box;}
+body{margin:0;padding:0;background:#090c10;color:#ffffff;font-family:Arial,Helvetica,sans-serif;}
+.header{background:#111820;padding:18px 15px;text-align:center;border-bottom:1px solid #26303b;}
+.title{font-size:24px;font-weight:bold;}
+.subtitle{margin-top:6px;color:#8e9aa7;font-size:13px;}
+.live{color:#36e887;font-weight:bold;margin-top:8px;}
+.container{width:100%;max-width:900px;margin:auto;padding:15px;}
+.camera-box{width:100%;background:#000;border:1px solid #29313c;border-radius:14px;overflow:hidden;position:relative;}
+.camera{width:100%;display:block;min-height:220px;object-fit:contain;background:#000;}
+.live-badge{position:absolute;top:12px;left:12px;padding:6px 10px;border-radius:6px;background:rgba(220,30,30,0.85);font-size:12px;font-weight:bold;}
+.panel{background:#111820;border:1px solid #26303b;border-radius:14px;margin-top:15px;padding:15px;}
+.panel-title{font-size:14px;color:#9eabb8;margin-bottom:10px;}
+.button-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+button{width:100%;padding:14px;border:none;border-radius:9px;font-size:15px;font-weight:bold;cursor:pointer;background:#263241;color:white;}
+button:active{transform:scale(0.98);}
+.btn-flash{background:#d99619;}
+.btn-capture{background:#1679d3;}
+.btn-restart{background:#b43a3a;}
+select{width:100%;padding:13px;border-radius:9px;background:#202a35;color:white;border:1px solid #364554;font-size:15px;}
+.info{font-size:13px;color:#8e9aa7;line-height:1.8;}
+.status{color:#36e887;}
+.footer{text-align:center;color:#586575;font-size:12px;padding:20px;}
+@media(max-width:500px){.button-grid{grid-template-columns:1fr;}.title{font-size:21px;}}
+</style>
+</head>
+<body>
+<div class="header">
+    <div class="title">ESP32-CAM CCTV</div>
+    <div class="subtitle">Standalone WiFi Camera</div>
+    <div class="live">● CAMERA ONLINE</div>
+</div>
+<div class="container">
+    <div class="camera-box">
+        <div class="live-badge">● LIVE</div>
+        <img id="stream" class="camera">
+    </div>
+    <div class="panel">
+        <div class="panel-title">CAMERA CONTROL</div>
+        <div class="button-grid">
+            <button id="flashButton" class="btn-flash" onclick="toggleFlash()">💡 เปิดไฟ Flash</button>
+            <button class="btn-capture" onclick="capturePhoto()">📷 ถ่ายภาพ</button>
+        </div>
+    </div>
+    <div class="panel">
+        <div class="panel-title">RESOLUTION</div>
+        <select id="resolution" onchange="changeResolution()">
+            <option value="QVGA">QVGA - 320 × 240</option>
+            <option value="VGA" selected>VGA - 640 × 480</option>
+            <option value="SVGA">SVGA - 800 × 600</option>
+            <option value="XGA">XGA - 1024 × 768</option>
+            <option value="SXGA">SXGA - 1280 × 1024</option>
+        </select>
+    </div>
+    <div class="panel">
+        <div class="panel-title">SYSTEM INFORMATION</div>
+        <div class="info">
+            WiFi : <b>ESP32-CAM-CCTV</b><br>
+            Camera IP : <b>192.168.4.1</b><br>
+            Stream : <b>192.168.4.1:81</b><br>
+            Status : <span class="status">ONLINE</span>
+        </div>
+    </div>
+    <div class="panel">
+        <button class="btn-restart" onclick="restartESP()">↻ Restart ESP32-CAM</button>
+    </div>
+</div>
+<div class="footer">ESP32-CAM Standalone CCTV</div>
+
+<script>
+let flashState = false;
+function startStream(){
+    let hostname = window.location.hostname;
+    document.getElementById("stream").src = "http://" + hostname + ":81/stream";
+}
+function toggleFlash(){
+    flashState = !flashState;
+    fetch("/flash?state=" + (flashState ? "1" : "0"));
+    let button = document.getElementById("flashButton");
+    if(flashState){ button.innerHTML = "💡 ปิดไฟ Flash"; }
+    else{ button.innerHTML = "💡 เปิดไฟ Flash"; }
+}
+function capturePhoto(){ window.open("/capture?t=" + Date.now(), "_blank"); }
+function changeResolution(){
+    let value = document.getElementById("resolution").value;
+    fetch("/resolution?size=" + value);
+}
+function restartESP(){ if(confirm("ต้องการ Restart ESP32-CAM หรือไม่?")){ fetch("/restart"); } }
+window.onload = function(){ startStream(); };
+</script>
+</body>
+</html>
+)rawliteral";
+
+static esp_err_t indexHandler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+// ============================================================
+// ฟังก์ชัน Video Streaming (แก้ไขปัญหาดึง CPU)
+// ============================================================
+static esp_err_t streamHandler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+  char partBuffer[64];
+
+  res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) { return res; }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+    } else {
+      res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+      if (res == ESP_OK) {
+        size_t hlen = snprintf(partBuffer, sizeof(partBuffer), STREAM_PART, fb->len);
+        res = httpd_resp_send_chunk(req, partBuffer, hlen);
+      }
+      if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+      }
+      esp_camera_fb_return(fb);
+      fb = NULL;
+    }
+
+    if (res != ESP_OK) { break; }
+
+    // --- จุดแก้ไขสำคัญ 1 ---
+    // เปลี่ยนจาก delay(10) เป็น delay(1) ร่วมกับ taskYIELD()
+    // เพื่อเปิดโอกาสให้โปรเซสเซอร์ไปจัดการงานระบบ WiFi
+    delay(1);
+    taskYIELD();
+  }
+  return res;
+}
+
+static esp_err_t captureHandler(httpd_req_t *req) {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=ESP32-CAM.jpg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+  esp_err_t result = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+  return result;
+}
+
+static esp_err_t flashHandler(httpd_req_t *req) {
+  char query[32];
+  char value[8];
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+    if (httpd_query_key_value(query, "state", value, sizeof(value)) == ESP_OK) {
+      if (atoi(value) == 1) {
+        flashState = true;
+        digitalWrite(FLASH_LED_PIN, HIGH);
+      } else {
+        flashState = false;
+        digitalWrite(FLASH_LED_PIN, LOW);
+      }
+    }
+  }
+  httpd_resp_set_type(req, "text/plain");
+  return httpd_resp_sendstr(req, flashState ? "ON" : "OFF");
+}
+
+static esp_err_t resolutionHandler(httpd_req_t *req) {
+  char query[64];
+  char sizeValue[20];
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) { return httpd_resp_send_404(req); }
+  if (httpd_query_key_value(query, "size", sizeValue, sizeof(sizeValue)) != ESP_OK) { return httpd_resp_send_404(req); }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  framesize_t frameSize;
+
+  if (strcmp(sizeValue, "QVGA") == 0) frameSize = FRAMESIZE_QVGA;
+  else if (strcmp(sizeValue, "VGA") == 0) frameSize = FRAMESIZE_VGA;
+  else if (strcmp(sizeValue, "SVGA") == 0) frameSize = FRAMESIZE_SVGA;
+  else if (strcmp(sizeValue, "XGA") == 0) frameSize = FRAMESIZE_XGA;
+  else if (strcmp(sizeValue, "SXGA") == 0) frameSize = FRAMESIZE_SXGA;
+  else frameSize = FRAMESIZE_VGA;
+
+  sensor->set_framesize(sensor, frameSize);
+  return httpd_resp_sendstr(req, "OK");
+}
+
+static esp_err_t restartHandler(httpd_req_t *req) {
+  httpd_resp_sendstr(req, "Restarting...");
+  delay(500);
+  ESP.restart();
+  return ESP_OK;
+}
+// ============================================================
+// ฟังก์ชันเริ่ม Web Server (ปรับแต่ง Config เพิ่มความเสถียร)
+// ============================================================
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  // --- จุดแก้ไขสำคัญ 2 ---
+  // เปิดระบบเคลียร์ Session เก่าทิ้งอัตโนมัติหากมีการค้าง
+  // และตั้งเวลา Timeout สั้นลงเพื่อคืนทรัพยากรให้ชิป
+  config.lru_purge_enable = true;
+  config.server_port = 80;
+  httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = indexHandler, .user_ctx = NULL };
+  httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = captureHandler, .user_ctx = NULL };
+  httpd_uri_t flash_uri = { .uri = "/flash", .method = HTTP_GET, .handler = flashHandler, .user_ctx = NULL };
+  httpd_uri_t resolution_uri = { .uri = "/resolution", .method = HTTP_GET, .handler = resolutionHandler, .user_ctx = NULL };
+  httpd_uri_t restart_uri = { .uri = "/restart", .method = HTTP_GET, .handler = restartHandler, .user_ctx = NULL };
+  if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(camera_httpd, &index_uri);
+    httpd_register_uri_handler(camera_httpd, &capture_uri);
+    httpd_register_uri_handler(camera_httpd, &flash_uri);
+    httpd_register_uri_handler(camera_httpd, &resolution_uri);
+    httpd_register_uri_handler(camera_httpd, &restart_uri);
+  }
+  config.server_port = 81;
+  config.ctrl_port += 1;
+  httpd_uri_t stream_uri = { .uri = "/stream", .method = HTTP_GET, .handler = streamHandler, .user_ctx = NULL };
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+  }
+}
+bool setupCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 12;  // ปรับลดคุณภาพลงเล็กน้อย (จาก 10 เป็น 12) เพื่อลดแบนด์วิธ ช่วยให้เชื่อมต่อได้หลายเครื่องขึ้น
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  }
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) { return false; }
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor) {
+    sensor->set_brightness(sensor, 0);
+    sensor->set_contrast(sensor, 0);
+    sensor->set_saturation(sensor, 0);
+    sensor->set_sharpness(sensor, 0);
+    sensor->set_whitebal(sensor, 1);
+    sensor->set_exposure_ctrl(sensor, 1);
+    sensor->set_gain_ctrl(sensor, 1);
+  }
+  return true;
+}
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
+  if (!setupCamera()) {
+    while (true) { delay(1000); }
+  }
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  // กำหนด Max Connections เป็น 4 เครื่อง
+  bool apResult = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, 0, 4);
+  startCameraServer();
+}
+void loop() {
+  delay(1000);
+}
